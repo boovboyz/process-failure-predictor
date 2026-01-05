@@ -27,7 +27,9 @@ A domain-agnostic process failure prediction demo application that uses machine 
 - **Database**: SQLite
 - **LLM**: Claude API (optional)
 
-## Quick Start
+---
+
+## Quick Start (Local Development)
 
 ### Prerequisites
 
@@ -60,6 +62,50 @@ npm run dev
 
 - **Frontend**: http://localhost:5173
 - **API Docs**: http://localhost:8000/docs
+
+---
+
+## Deploy to AWS EC2
+
+### Prerequisites
+- AWS Account
+- SSH key pair for EC2
+
+### Step 1: Launch EC2 Instance
+1. Go to AWS Console → EC2 → Launch Instance
+2. Choose **Ubuntu 22.04 LTS** (t2.micro for free tier, t3.small recommended)
+3. Configure Security Group:
+   - **SSH (22)** - Your IP
+   - **HTTP (80)** - Anywhere (0.0.0.0/0)
+4. Create or select a key pair
+5. Launch and note the **Public IP**
+
+### Step 2: Deploy
+
+```bash
+# Connect to EC2
+ssh -i your-key.pem ubuntu@YOUR_EC2_PUBLIC_IP
+
+# Clone repository
+git clone https://github.com/YOUR_USERNAME/process-failure-predictor.git
+cd process-failure-predictor
+
+# Run deployment script
+chmod +x deploy.sh
+./deploy.sh
+```
+
+### Step 3: Access Your Demo
+Open in browser: `http://YOUR_EC2_PUBLIC_IP`
+
+### Useful Commands on EC2
+```bash
+sudo docker compose logs -f    # View logs
+sudo docker compose down       # Stop
+sudo docker compose restart    # Restart
+```
+
+---
 
 ## Environment Variables
 
