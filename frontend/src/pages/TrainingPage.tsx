@@ -72,7 +72,7 @@ export default function TrainingPage() {
                     </p>
 
                     <div className="mt-8 space-y-4 max-w-md mx-auto">
-                        {['Next Activity Model', 'Outcome Model', 'Time Model', 'Calibration'].map((task, i) => (
+                        {['Next Activity Model', 'Outcome Model', 'Time Model', 'Calibration'].map((task) => (
                             <div key={task} className="flex items-center gap-3 text-left">
                                 <div className="w-6 h-6 rounded-full bg-primary-500/30 flex items-center justify-center">
                                     <div className="w-2 h-2 rounded-full bg-primary-400 animate-pulse" />

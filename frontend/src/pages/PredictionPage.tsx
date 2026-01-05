@@ -27,7 +27,7 @@ export default function PredictionPage() {
     const [events, setEvents] = useState<Event[]>([])
     const [prefixLength, setPrefixLength] = useState(3)
 
-    const { data: testCases, isLoading: loadingCases } = useQuery({
+    const { data: testCases } = useQuery({
         queryKey: ['test-cases', logId],
         queryFn: () => api.getTestCases(logId!, 15),
         enabled: !!logId,
