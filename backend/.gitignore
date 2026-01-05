@@ -1,0 +1,31 @@
+# Environment variables
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# Data files (keep samples)
+data/uploads/*
+data/models/*
+data/splits/*
+!data/samples/
+
+# Database
+*.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

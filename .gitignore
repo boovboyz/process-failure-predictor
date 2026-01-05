@@ -1,0 +1,36 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment variables
+.env
+*.env.local
+
+# Data files (keep samples)
+backend/data/uploads/*
+backend/data/models/*
+backend/data/splits/*
+!backend/data/samples/
+
+# Database
+*.db
+
+# Build outputs
+dist/
+build/
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
