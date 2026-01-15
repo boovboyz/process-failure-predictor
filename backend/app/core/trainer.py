@@ -1,20 +1,31 @@
 """
 Model training pipeline for process prediction.
-Trains XGBoost models for next-activity, outcome, and time prediction.
+Trains XGBoost or LightGBM models for next-activity, outcome, and time prediction.
 """
 import numpy as np
 import xgboost as xgb
 from sklearn.model_selection import train_test_split
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Literal
 import joblib
 import time
 from pathlib import Path
+
+# Optional LightGBM support
+try:
+    import lightgbm as lgb
+    HAS_LIGHTGBM = True
+except ImportError:
+    HAS_LIGHTGBM = False
 
 from app.core.xes_parser import Trace
 from app.core.prefix_generator import generate_prefixes, PrefixSample
 from app.core.feature_engineer import FeatureEngineer
 from app.core.calibration import ProbabilityCalibrator
 from app.core.time_confidence import QuantileTimePredictor
+
+
+# Model type alias
+ModelType = Literal["xgboost", "lightgbm"]
 
 
 class ProcessPredictor:
@@ -25,9 +36,22 @@ class ProcessPredictor:
     - Next activity prediction (multi-class classification)
     - Outcome prediction (multi-class classification)
     - Remaining time prediction (quantile regression)
+    
+    Supports both XGBoost and LightGBM backends.
     """
     
-    def __init__(self):
+    def __init__(self, model_type: ModelType = "xgboost"):
+        """
+        Initialize the predictor.
+        
+        Args:
+            model_type: Model backend to use ("xgboost" or "lightgbm")
+        """
+        self.model_type = model_type
+        
+        if model_type == "lightgbm" and not HAS_LIGHTGBM:
+            raise ImportError("LightGBM not installed. Run: pip install lightgbm")
+        
         self.feature_engineer = FeatureEngineer()
         self.next_activity_model = None
         self.outcome_model = None
@@ -46,14 +70,115 @@ class ProcessPredictor:
         
         self.is_trained = False
     
-    def train(self, train_traces: List[Trace], 
-              val_ratio: float = 0.2) -> Dict[str, Dict[str, float]]:
+    def _create_classifier(self, n_classes: int, is_binary: bool = False):
+        """Create a classifier based on model_type."""
+        if self.model_type == "lightgbm":
+            return lgb.LGBMClassifier(
+                n_estimators=200,
+                max_depth=6,
+                learning_rate=0.1,
+                objective='binary' if is_binary else 'multiclass',
+                num_class=None if is_binary else n_classes,
+                metric='binary_logloss' if is_binary else 'multi_logloss',
+                random_state=42,
+                verbose=-1,
+                force_col_wise=True,
+            )
+        else:  # xgboost
+            return xgb.XGBClassifier(
+                n_estimators=200,
+                max_depth=6,
+                learning_rate=0.1,
+                objective='binary:logistic' if is_binary else 'multi:softprob',
+                num_class=None if is_binary else n_classes,
+                eval_metric='logloss' if is_binary else 'mlogloss',
+                early_stopping_rounds=20,
+                random_state=42,
+                verbosity=0,
+            )
+    
+    def _create_regressor(self):
+        """Create a regressor based on model_type."""
+        if self.model_type == "lightgbm":
+            return lgb.LGBMRegressor(
+                n_estimators=200,
+                max_depth=6,
+                learning_rate=0.1,
+                objective='regression',
+                metric='mae',
+                random_state=42,
+                verbose=-1,
+                force_col_wise=True,
+            )
+        else:  # xgboost
+            return xgb.XGBRegressor(
+                n_estimators=200,
+                max_depth=6,
+                learning_rate=0.1,
+                objective='reg:squarederror',
+                eval_metric='mae',
+                early_stopping_rounds=20,
+                random_state=42,
+                verbosity=0,
+            )
+    
+    def _create_tuned_classifier(self, params: Dict, n_classes: int, is_binary: bool = False):
+        """Create a classifier with tuned hyperparameters."""
+        params = {**params, 'random_state': 42}
+        
+        if self.model_type == "lightgbm":
+            params['verbose'] = -1
+            params['force_col_wise'] = True
+            if is_binary:
+                params['objective'] = 'binary'
+                params['metric'] = 'binary_logloss'
+            else:
+                params['objective'] = 'multiclass'
+                params['num_class'] = n_classes
+                params['metric'] = 'multi_logloss'
+            return lgb.LGBMClassifier(**params)
+        else:
+            params['verbosity'] = 0
+            if is_binary:
+                params['objective'] = 'binary:logistic'
+                params['eval_metric'] = 'logloss'
+            else:
+                params['objective'] = 'multi:softprob'
+                params['num_class'] = n_classes
+                params['eval_metric'] = 'mlogloss'
+            return xgb.XGBClassifier(**params)
+    
+    def _create_tuned_regressor(self, params: Dict):
+        """Create a regressor with tuned hyperparameters."""
+        params = {**params, 'random_state': 42}
+        
+        if self.model_type == "lightgbm":
+            params['verbose'] = -1
+            params['force_col_wise'] = True
+            params['objective'] = 'regression'
+            params['metric'] = 'mae'
+            return lgb.LGBMRegressor(**params)
+        else:
+            params['verbosity'] = 0
+            params['objective'] = 'reg:squarederror'
+            params['eval_metric'] = 'mae'
+            return xgb.XGBRegressor(**params)
+    
+    def train(
+        self,
+        train_traces: List[Trace], 
+        val_ratio: float = 0.2,
+        auto_tune: bool = False,
+        tune_trials: int = 30,
+    ) -> Dict[str, Dict[str, float]]:
         """
         Train all prediction models.
         
         Args:
             train_traces: List of training traces
             val_ratio: Ratio of training data to use for validation
+            auto_tune: Whether to run hyperparameter tuning before training
+            tune_trials: Number of Optuna trials for hyperparameter tuning
             
         Returns:
             Dictionary of metrics per task
@@ -105,25 +230,77 @@ class ProcessPredictor:
         metrics = {}
         
         # ─────────────────────────────────────────────────────────────────────
+        # Optional Hyperparameter Tuning
+        # ─────────────────────────────────────────────────────────────────────
+        tuned_params = {}
+        if auto_tune:
+            from app.core.hyperparameter_tuning import HyperparameterTuner
+            
+            try:
+                # Tune for next activity prediction
+                activity_tuner = HyperparameterTuner(
+                    model_type=self.model_type,
+                    task_type="classification",
+                    n_trials=tune_trials,
+                    metric="accuracy",
+                )
+                tuned_params['activity'] = activity_tuner.tune(
+                    X_train, y_act_train,
+                    n_classes=len(activities),
+                )
+                
+                # Tune for outcome prediction if applicable
+                if len(outcomes) > 1:
+                    outcome_tuner = HyperparameterTuner(
+                        model_type=self.model_type,
+                        task_type="classification",
+                        n_trials=tune_trials,
+                        metric="accuracy",
+                    )
+                    tuned_params['outcome'] = outcome_tuner.tune(
+                        X_train, y_out_train,
+                        n_classes=len(outcomes),
+                    )
+                
+                # Tune for time prediction
+                time_tuner = HyperparameterTuner(
+                    model_type=self.model_type,
+                    task_type="regression",
+                    n_trials=tune_trials,
+                    metric="mae",
+                )
+                tuned_params['time'] = time_tuner.tune(X_train, y_time_train)
+                
+                metrics['tuned_params'] = tuned_params
+            except Exception as e:
+                # Graceful fallback: if tuning fails, use default params
+                print(f"⚠ Hyperparameter tuning failed: {e}. Using default parameters.")
+                tuned_params = {}
+                metrics['tuning_error'] = str(e)
+        
+        # ─────────────────────────────────────────────────────────────────────
         # Train Next Activity Model (multi-class)
         # ─────────────────────────────────────────────────────────────────────
-        self.next_activity_model = xgb.XGBClassifier(
-            n_estimators=200,
-            max_depth=6,
-            learning_rate=0.1,
-            objective='multi:softprob',
-            num_class=len(activities),
-            eval_metric='mlogloss',
-            early_stopping_rounds=20,
-            random_state=42,
-            verbosity=0,
-        )
+        if auto_tune and 'activity' in tuned_params:
+            self.next_activity_model = self._create_tuned_classifier(
+                tuned_params['activity'],
+                n_classes=len(activities),
+                is_binary=False
+            )
+        else:
+            self.next_activity_model = self._create_classifier(
+                n_classes=len(activities),
+                is_binary=False
+            )
         
-        self.next_activity_model.fit(
-            X_train, y_act_train,
-            eval_set=[(X_val, y_act_val)],
-            verbose=False
-        )
+        if self.model_type == "lightgbm":
+            self.next_activity_model.fit(X_train, y_act_train)
+        else:
+            self.next_activity_model.fit(
+                X_train, y_act_train,
+                eval_set=[(X_val, y_act_val)],
+                verbose=False
+            )
         
         # Evaluate and calibrate
         val_probs = self.next_activity_model.predict_proba(X_val)
@@ -142,23 +319,26 @@ class ProcessPredictor:
         # Train Outcome Model (multi-class)
         # ─────────────────────────────────────────────────────────────────────
         if len(outcomes) > 1:
-            self.outcome_model = xgb.XGBClassifier(
-                n_estimators=200,
-                max_depth=6,
-                learning_rate=0.1,
-                objective='multi:softprob' if len(outcomes) > 2 else 'binary:logistic',
-                num_class=len(outcomes) if len(outcomes) > 2 else None,
-                eval_metric='mlogloss' if len(outcomes) > 2 else 'logloss',
-                early_stopping_rounds=20,
-                random_state=42,
-                verbosity=0,
-            )
+            if auto_tune and 'outcome' in tuned_params:
+                self.outcome_model = self._create_tuned_classifier(
+                    tuned_params['outcome'],
+                    n_classes=len(outcomes),
+                    is_binary=(len(outcomes) == 2)
+                )
+            else:
+                self.outcome_model = self._create_classifier(
+                    n_classes=len(outcomes),
+                    is_binary=(len(outcomes) == 2)
+                )
             
-            self.outcome_model.fit(
-                X_train, y_out_train,
-                eval_set=[(X_val, y_out_val)],
-                verbose=False
-            )
+            if self.model_type == "lightgbm":
+                self.outcome_model.fit(X_train, y_out_train)
+            else:
+                self.outcome_model.fit(
+                    X_train, y_out_train,
+                    eval_set=[(X_val, y_out_val)],
+                    verbose=False
+                )
             
             # Evaluate and calibrate
             out_probs = self.outcome_model.predict_proba(X_val)
@@ -177,22 +357,19 @@ class ProcessPredictor:
         # ─────────────────────────────────────────────────────────────────────
         # Train Time Model (regression + quantile)
         # ─────────────────────────────────────────────────────────────────────
-        self.time_model = xgb.XGBRegressor(
-            n_estimators=200,
-            max_depth=6,
-            learning_rate=0.1,
-            objective='reg:squarederror',
-            eval_metric='mae',
-            early_stopping_rounds=20,
-            random_state=42,
-            verbosity=0,
-        )
+        if auto_tune and 'time' in tuned_params:
+            self.time_model = self._create_tuned_regressor(tuned_params['time'])
+        else:
+            self.time_model = self._create_regressor()
         
-        self.time_model.fit(
-            X_train, y_time_train,
-            eval_set=[(X_val, y_time_val)],
-            verbose=False
-        )
+        if self.model_type == "lightgbm":
+            self.time_model.fit(X_train, y_time_train)
+        else:
+            self.time_model.fit(
+                X_train, y_time_train,
+                eval_set=[(X_val, y_time_val)],
+                verbose=False
+            )
         
         # Train quantile models for confidence intervals
         self.time_quantile_model.fit(X_train, y_time_train)
@@ -276,6 +453,7 @@ class ProcessPredictor:
     def save(self, path: str):
         """Save all models and state."""
         save_data = {
+            'model_type': self.model_type,  # Persist model type
             'feature_engineer': self.feature_engineer.get_state(),
             'next_activity_model': self.next_activity_model,
             'outcome_model': self.outcome_model,
@@ -303,7 +481,9 @@ class ProcessPredictor:
         """Load trained predictor."""
         data = joblib.load(path)
         
-        predictor = cls()
+        # Restore model_type if saved, default to xgboost for backwards compatibility
+        model_type = data.get('model_type', 'xgboost')
+        predictor = cls(model_type=model_type)
         predictor.feature_engineer.set_state(data['feature_engineer'])
         predictor.next_activity_model = data['next_activity_model']
         predictor.outcome_model = data['outcome_model']

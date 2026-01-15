@@ -9,6 +9,11 @@ from app.core.xes_parser import Trace, Event
 from app.core.prefix_generator import PrefixSample
 
 
+# Special tokens
+UNK_TOKEN = "<UNK>"
+PAD_TOKEN = "<PAD>"
+
+
 class FeatureEngineer:
     """
     Feature engineering for process prediction.
@@ -26,6 +31,7 @@ class FeatureEngineer:
         self.time_stats: Dict[str, float] = {}
         self.activity_frequencies: Dict[str, float] = {}
         self.top_activities: List[str] = []
+        self.unknown_activities: set = set()  # Track unknown activities at prediction time
         self.is_fitted = False
         
     def fit(self, train_traces: List[Trace]):
@@ -35,14 +41,20 @@ class FeatureEngineer:
         Args:
             train_traces: List of training traces
         """
-        # Build activity vocabulary
+        # Build activity vocabulary with special tokens
         all_activities = set()
         for trace in train_traces:
             for event in trace.events:
                 all_activities.add(event.activity)
         
-        # Sort for consistent encoding
-        self.activity_encoder = {a: i for i, a in enumerate(sorted(all_activities))}
+        # Sort for consistent encoding, reserve 0 and 1 for special tokens
+        sorted_activities = sorted(all_activities)
+        self.activity_encoder = {PAD_TOKEN: 0, UNK_TOKEN: 1}
+        for i, a in enumerate(sorted_activities):
+            self.activity_encoder[a] = i + 2
+        
+        # Reset unknown activities tracker
+        self.unknown_activities = set()
         
         # Learn transition probabilities
         transition_counts = Counter()
@@ -102,6 +114,23 @@ class FeatureEngineer:
         self.time_stats['mean_trace_length'] = np.mean(trace_lengths) if trace_lengths else 10.0
         
         self.is_fitted = True
+    
+    def _encode_activity(self, activity: str) -> int:
+        """
+        Encode activity with robust unknown handling.
+        
+        Args:
+            activity: Activity name to encode
+            
+        Returns:
+            Encoded integer. Returns UNK token encoding for unknown activities.
+        """
+        if activity in self.activity_encoder:
+            return self.activity_encoder[activity]
+        
+        # Track unknown activity for monitoring
+        self.unknown_activities.add(activity)
+        return self.activity_encoder.get(UNK_TOKEN, 1)
         
     def transform(self, prefix: PrefixSample) -> np.ndarray:
         """
@@ -162,15 +191,15 @@ class FeatureEngineer:
         features.append(len(set(e.activity for e in events)))
         
         # 8. last_activity_encoded
-        features.append(self.activity_encoder.get(last_event.activity, -1))
+        features.append(self._encode_activity(last_event.activity))
         
         # 9-11. last_3_activities (encoded, padded)
         last_3 = [e.activity for e in events[-3:]]
         while len(last_3) < 3:
-            last_3.insert(0, '<PAD>')
+            last_3.insert(0, PAD_TOKEN)
         
         for act in last_3:
-            features.append(self.activity_encoder.get(act, -1))
+            features.append(self._encode_activity(act))
         
         # 12-16. activity_occurrence_counts (top 5 activities)
         activity_counts = Counter(e.activity for e in events)
@@ -227,6 +256,80 @@ class FeatureEngineer:
         else:
             features.append(0)
         
+        # ─────────────────────────────────────────────────────────────────────
+        # ADVANCED FEATURES (10 new)
+        # ─────────────────────────────────────────────────────────────────────
+        
+        # 24. resource_switch_count - how many times the resource changed
+        resources = [e.resource for e in events if e.resource]
+        resource_switches = 0
+        for i in range(1, len(resources)):
+            if resources[i] != resources[i-1]:
+                resource_switches += 1
+        features.append(resource_switches)
+        
+        # 25. unique_resources - number of distinct resources involved
+        features.append(len(set(resources)) if resources else 0)
+        
+        # 26. same_resource_streak - consecutive events with same resource
+        same_resource_streak = 1
+        if len(resources) > 1:
+            for i in range(len(resources) - 1, 0, -1):
+                if resources[i] == resources[i-1]:
+                    same_resource_streak += 1
+                else:
+                    break
+        features.append(same_resource_streak)
+        
+        # 27. bigram_frequency - how common is the last activity pair
+        if len(events) > 1:
+            bigram = (events[-2].activity, last_event.activity)
+            bigram_freq = self.transition_probs.get(bigram, 0)
+        else:
+            bigram_freq = 0
+        features.append(bigram_freq)
+        
+        # 28. direct_loop_count - A→A patterns (immediate rework/retry)
+        direct_loops = 0
+        for i in range(1, len(events)):
+            if events[i].activity == events[i-1].activity:
+                direct_loops += 1
+        features.append(direct_loops)
+        
+        # 29. back_loop_count - returning to earlier activity (rework pattern)
+        seen_activities = set()
+        back_loops = 0
+        for event in events:
+            if event.activity in seen_activities:
+                back_loops += 1
+            seen_activities.add(event.activity)
+        features.append(back_loops)
+        
+        # 30. estimated_progress - position in typical process (0-1)
+        estimated_progress = min(len(events) / self.time_stats['mean_trace_length'], 1.0)
+        features.append(estimated_progress)
+        
+        # 31. time_acceleration - is process speeding up or slowing down
+        if len(inter_event_times) >= 2:
+            recent_avg = np.mean(inter_event_times[-2:])
+            overall_avg = np.mean(inter_event_times)
+            acceleration = (overall_avg - recent_avg) / (overall_avg + 1e-6)
+        else:
+            acceleration = 0
+        features.append(acceleration)
+        
+        # 32. time_variance - consistency of inter-event times
+        if len(inter_event_times) >= 2:
+            time_variance = np.std(inter_event_times) / (np.mean(inter_event_times) + 1e-6)
+        else:
+            time_variance = 0
+        features.append(time_variance)
+        
+        # 33. weekend_ratio - fraction of events on weekends
+        weekend_events = sum(1 for e in events if e.timestamp.weekday() >= 5)
+        weekend_ratio = weekend_events / len(events) if events else 0
+        features.append(weekend_ratio)
+        
         return np.array(features, dtype=np.float32)
     
     def transform_batch(self, prefixes: List[PrefixSample]) -> np.ndarray:
@@ -244,7 +347,7 @@ class FeatureEngineer:
     @property
     def num_features(self) -> int:
         """Get number of features."""
-        return 23  # Actual count of features
+        return 33  # 23 original + 10 advanced features
     
     @property
     def feature_names(self) -> List[str]:
@@ -283,6 +386,17 @@ class FeatureEngineer:
             "elapsed_time_percentile",
             "activity_rarity",
             "avg_inter_event_time_hours",
+            # Advanced (10 new)
+            "resource_switch_count",
+            "unique_resources",
+            "same_resource_streak",
+            "bigram_frequency",
+            "direct_loop_count",
+            "back_loop_count",
+            "estimated_progress",
+            "time_acceleration",
+            "time_variance",
+            "weekend_ratio",
         ])
         
         return names
@@ -295,17 +409,28 @@ class FeatureEngineer:
             'time_stats': self.time_stats,
             'activity_frequencies': self.activity_frequencies,
             'top_activities': self.top_activities,
+            'unknown_activities': list(self.unknown_activities),
             'is_fitted': self.is_fitted,
         }
     
     def set_state(self, state: dict):
         """Set state from deserialized data."""
+        import ast
+        
         self.activity_encoder = state['activity_encoder']
-        # Convert string keys back to tuples
-        self.transition_probs = {
-            eval(k): v for k, v in state['transition_probs'].items()
-        }
+        # Convert string keys back to tuples safely (no eval!)
+        self.transition_probs = {}
+        for k, v in state['transition_probs'].items():
+            # Parse tuple string like "('A', 'B')" safely
+            try:
+                key_tuple = ast.literal_eval(k)
+                self.transition_probs[key_tuple] = v
+            except (ValueError, SyntaxError):
+                # Skip malformed keys
+                pass
         self.time_stats = state['time_stats']
         self.activity_frequencies = state['activity_frequencies']
         self.top_activities = state['top_activities']
+        self.unknown_activities = set(state.get('unknown_activities', []))
         self.is_fitted = state['is_fitted']
+

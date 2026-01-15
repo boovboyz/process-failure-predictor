@@ -70,6 +70,24 @@ class TrainingMetrics(BaseModel):
     validation_score: Optional[float] = None
 
 
+class TrainingRequest(BaseModel):
+    """Request body for model training with optional parameters."""
+    model_type: str = Field(
+        default="xgboost",
+        description="Model backend: 'xgboost' or 'lightgbm'"
+    )
+    auto_tune: bool = Field(
+        default=False,
+        description="Enable automatic hyperparameter tuning with Optuna"
+    )
+    tune_trials: int = Field(
+        default=30,
+        ge=10,
+        le=200,
+        description="Number of Optuna trials (10-200)"
+    )
+
+
 class TrainingResponse(BaseModel):
     """Response from model training."""
     model_id: str

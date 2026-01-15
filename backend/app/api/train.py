@@ -4,11 +4,12 @@ Training API endpoints.
 import uuid
 import time
 from pathlib import Path
+from typing import Optional
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 
 from app.core.trainer import ProcessPredictor
 from app.api.split import load_split_data
-from app.models.schemas import TrainingResponse, ModelStatus, TrainingMetrics
+from app.models.schemas import TrainingResponse, ModelStatus, TrainingMetrics, TrainingRequest
 from app.database import (
     get_latest_split_for_log, save_model, update_model_status, get_model
 )
@@ -47,12 +48,29 @@ def _train_model_async(model_id: str, split_id: str, model_path: str):
 
 
 @router.post("/train/{log_id}", response_model=TrainingResponse)
-async def train_models(log_id: str, background_tasks: BackgroundTasks):
+async def train_models(
+    log_id: str, 
+    background_tasks: BackgroundTasks,
+    request: TrainingRequest = TrainingRequest()
+):
     """
     Train prediction models on split data.
     
-    Training runs in background. Use /models/{model_id}/status to check progress.
+    Training runs synchronously. Use /models/{model_id}/status to check progress.
+    
+    Parameters:
+    - model_type: "xgboost" (default) or "lightgbm"
+    - auto_tune: Enable Optuna hyperparameter tuning (slower but better)
+    - tune_trials: Number of Optuna trials (10-200)
+    - tune_timeout: Timeout in seconds for tuning
     """
+    # Validate model_type
+    if request.model_type not in ("xgboost", "lightgbm"):
+        raise HTTPException(
+            status_code=400,
+            detail="model_type must be 'xgboost' or 'lightgbm'"
+        )
+    
     # Get latest split
     split_info = get_latest_split_for_log(log_id)
     if not split_info:
@@ -76,20 +94,32 @@ async def train_models(log_id: str, background_tasks: BackgroundTasks):
         model_path=model_path
     )
     
-    # For simplicity, we'll train synchronously for now
-    # In production, you'd use background_tasks or a task queue
     try:
         start_time = time.time()
         
         split_data = load_split_data(split_id)
         train_traces = split_data['train_traces']
         
-        predictor = ProcessPredictor()
-        metrics = predictor.train(train_traces)
+        # Create predictor with specified model type
+        predictor = ProcessPredictor(model_type=request.model_type)
+        
+        # Train with optional hyperparameter tuning
+        metrics = predictor.train(
+            train_traces,
+            auto_tune=request.auto_tune,
+            tune_trials=request.tune_trials,
+        )
         
         predictor.save(model_path)
         
         training_time = time.time() - start_time
+        
+        # Add model config to metrics
+        metrics['config'] = {
+            'model_type': request.model_type,
+            'auto_tune': request.auto_tune,
+            'tune_trials': request.tune_trials if request.auto_tune else None,
+        }
         
         update_model_status(
             model_id,

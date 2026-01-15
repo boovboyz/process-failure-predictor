@@ -24,6 +24,7 @@ async def upload_xes(file: UploadFile = File(...)):
     Upload and parse XES file.
     
     Returns statistics about the uploaded event log.
+    Supports large files up to 500MB.
     """
     if not file.filename.endswith('.xes'):
         raise HTTPException(status_code=400, detail="File must be a .xes file")
@@ -35,10 +36,11 @@ async def upload_xes(file: UploadFile = File(...)):
     file_path = UPLOAD_DIR / f"{log_id}.xes"
     
     try:
-        # Save uploaded file
-        content = await file.read()
+        # Save uploaded file using chunked reading for large files
         with open(file_path, 'wb') as f:
-            f.write(content)
+            # Read in 1MB chunks to handle large files
+            while chunk := await file.read(1024 * 1024):
+                f.write(chunk)
         
         # Parse XES file
         event_log = parse_xes(str(file_path))

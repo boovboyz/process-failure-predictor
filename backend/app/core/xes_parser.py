@@ -305,19 +305,107 @@ def validate_log(log: EventLog) -> List[str]:
     issues = []
     
     if not log.traces:
-        issues.append("Event log has no traces")
+        issues.append("ERROR: Event log has no traces")
         return issues
+    
+    empty_traces = 0
+    traces_without_id = 0
+    events_without_activity = 0
+    events_without_timestamp = 0
     
     for i, trace in enumerate(log.traces):
         if not trace.case_id:
-            issues.append(f"Trace {i} has no case ID")
+            traces_without_id += 1
         
         if not trace.events:
-            issues.append(f"Trace '{trace.case_id}' has no events")
+            empty_traces += 1
             continue
         
         for j, event in enumerate(trace.events):
             if not event.activity:
-                issues.append(f"Event {j} in trace '{trace.case_id}' has no activity name")
+                events_without_activity += 1
+            
+            # Check for default/placeholder timestamp
+            if event.timestamp.year < 1970:
+                events_without_timestamp += 1
+    
+    # Aggregate warnings
+    if empty_traces > 0:
+        issues.append(f"WARNING: {empty_traces} traces have no events")
+    
+    if traces_without_id > 0:
+        issues.append(f"WARNING: {traces_without_id} traces have no case ID")
+    
+    if events_without_activity > 0:
+        issues.append(f"WARNING: {events_without_activity} events have no activity name")
+    
+    if events_without_timestamp > 0:
+        issues.append(f"WARNING: {events_without_timestamp} events have invalid timestamps")
+    
+    # Additional quality checks
+    valid_traces = [t for t in log.traces if t.events]
+    if valid_traces:
+        avg_events = sum(len(t.events) for t in valid_traces) / len(valid_traces)
+        if avg_events < 2:
+            issues.append(f"WARNING: Average trace length is very short ({avg_events:.1f} events)")
     
     return issues
+
+
+def validate_and_clean(log: EventLog) -> tuple:
+    """
+    Validate and clean an event log for training.
+    
+    Performs:
+    - Removes empty traces
+    - Sorts events by timestamp within each trace
+    - Assigns default case IDs to traces without them
+    - Filters out events without activities
+    
+    Args:
+        log: EventLog to validate and clean
+        
+    Returns:
+        Tuple of (cleaned EventLog, list of warnings)
+    """
+    from typing import Tuple
+    
+    warnings = []
+    cleaned_traces = []
+    
+    for i, trace in enumerate(log.traces):
+        # Skip empty traces
+        if not trace.events:
+            warnings.append(f"Removed empty trace: {trace.case_id or f'trace_{i}'}")
+            continue
+        
+        # Assign default case ID if missing
+        if not trace.case_id:
+            trace.case_id = f"case_{i}"
+            warnings.append(f"Assigned default case ID: {trace.case_id}")
+        
+        # Filter out events without activity names
+        valid_events = [e for e in trace.events if e.activity]
+        if len(valid_events) < len(trace.events):
+            warnings.append(f"Removed {len(trace.events) - len(valid_events)} events without activity from {trace.case_id}")
+        
+        if not valid_events:
+            warnings.append(f"Removed trace {trace.case_id} after filtering (no valid events)")
+            continue
+        
+        # Sort events by timestamp
+        valid_events.sort(key=lambda e: e.timestamp)
+        
+        # Check for duplicate timestamps
+        timestamps = [e.timestamp for e in valid_events]
+        if len(timestamps) != len(set(timestamps)):
+            warnings.append(f"Trace {trace.case_id} has duplicate timestamps")
+        
+        trace.events = valid_events
+        cleaned_traces.append(trace)
+    
+    # Create new cleaned log
+    cleaned_log = EventLog(traces=cleaned_traces, attributes=log.attributes)
+    
+    return cleaned_log, warnings
+
